@@ -52,7 +52,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QUrl, QTimer, QRect, QPoint, QSize,
-    QEvent, QObject,
+    QEvent, QObject, QRectF,
 )
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QMouseEvent, QPaintEvent,
@@ -763,10 +763,14 @@ class ROIOverlay(QObject):
         # ROI 矩形（原视频坐标系）
         self.roi_rect: Optional[tuple] = None  # (x1, y1, x2, y2)
 
-        # 拖拽状态
+        # 拖拽/调整 状态
         self._drawing = False
         self._start_ui = QPoint()
         self._current_ui = QPoint()
+
+        # 边缘 resize 状态
+        self._resize_edge: Optional[str] = None  # 'tl','tr','bl','br','t','b','l','r'
+        self._resize_orig_rect: Optional[tuple] = None  # resize 开始时的原始 roi_rect
 
     # ---------- 坐标映射 ----------
 
@@ -795,6 +799,27 @@ class ROIOverlay(QObject):
         uy = vy * self.scale + self.off_y
         return ux, uy
 
+    # ---------- 获取当前交互选区 ----------
+
+    def get_drag_ui_rect(self) -> Optional[tuple]:
+        """
+        返回当前交互（拖拽或 resize）中的选区在 UI 控件坐标系下的矩形坐标。
+        仅在进行中时返回有效值，用于实时绘制覆盖层。
+        """
+        if self._resize_edge and self.roi_rect:
+            # resize 中：将当前 roi_rect 转换为 UI 坐标
+            vx1, vy1, vx2, vy2 = self.roi_rect
+            ux1, uy1 = self.video_to_ui(vx1, vy1)
+            ux2, uy2 = self.video_to_ui(vx2, vy2)
+            return (ux1, uy1, ux2, uy2)
+        if self._drawing:
+            x1 = min(self._start_ui.x(), self._current_ui.x())
+            y1 = min(self._start_ui.y(), self._current_ui.y())
+            x2 = max(self._start_ui.x(), self._current_ui.x())
+            y2 = max(self._start_ui.y(), self._current_ui.y())
+            return (x1, y1, x2, y2)
+        return None
+
     # ---------- 设置视频分辨率 ----------
 
     def set_video_resolution(self, w: int, h: int):
@@ -802,6 +827,8 @@ class ROIOverlay(QObject):
         self.orig_w = w
         self.orig_h = h
         self.roi_rect = None
+        self._resize_edge = None
+        self._resize_orig_rect = None
         self.update_mapping()
         self._video.update()
 
@@ -816,10 +843,47 @@ class ROIOverlay(QObject):
 
     def clear_roi(self):
         self.roi_rect = None
+        self._resize_edge = None
+        self._resize_orig_rect = None
         self.roi_changed.emit(None)
         self._video.update()
 
-    # ---------- 事件过滤器（拦截鼠标事件用于 ROI 拖拽） ----------
+    # ---------- 事件过滤器（拦截鼠标事件用于 ROI 拖拽 / 调整） ----------
+
+    def _get_video_display_rect(self) -> tuple:
+        """返回视频显示区域的 UI 坐标边界 (left, top, right, bottom)"""
+        self.update_mapping()
+        l = self.off_x
+        t = self.off_y
+        r = self.off_x + self.orig_w * self.scale
+        b = self.off_y + self.orig_h * self.scale
+        return l, t, r, b
+
+    def _hit_test_roi_edge(self, ui_pos) -> Optional[str]:
+        """
+        检测鼠标是否靠近已有 ROI 的边缘。
+        返回边缘标识：'tl','tr','bl','br','t','b','l','r' 或 None。
+        """
+        if not self.roi_rect:
+            return None
+        vx1, vy1, vx2, vy2 = self.roi_rect
+        ux1, uy1 = self.video_to_ui(vx1, vy1)
+        ux2, uy2 = self.video_to_ui(vx2, vy2)
+        px, py = ui_pos.x(), ui_pos.y()
+        threshold = 8
+        near_l = abs(px - ux1) <= threshold
+        near_r = abs(px - ux2) <= threshold
+        near_t = abs(py - uy1) <= threshold
+        near_b = abs(py - uy2) <= threshold
+        if near_l and near_t: return 'tl'
+        if near_r and near_t: return 'tr'
+        if near_l and near_b: return 'bl'
+        if near_r and near_b: return 'br'
+        if near_l: return 'l'
+        if near_r: return 'r'
+        if near_t: return 't'
+        if near_b: return 'b'
+        return None
 
     def eventFilter(self, obj, event):
         """拦截 MainVideoWidget 上的鼠标事件"""
@@ -836,25 +900,103 @@ class ROIOverlay(QObject):
 
     def _on_press(self, ev):
         if ev.button() == Qt.MouseButton.LeftButton:
+            # ① ROI 已存在 → 检查是否靠近边缘（resize 模式）
+            if self.roi_rect:
+                edge = self._hit_test_roi_edge(ev.pos())
+                if edge:
+                    self._resize_edge = edge
+                    self._resize_orig_rect = self.roi_rect
+                    self._video.update()
+                    return True
+            # ② 否则开始全新的拖拽选区
             self._drawing = True
             self._start_ui = ev.pos()
             self._current_ui = ev.pos()
             self.roi_rect = None
+            self._resize_edge = None
+            self._resize_orig_rect = None
             self._video.update()
             return True
         return False
 
     def _on_move(self, ev):
-        if self._drawing:
-            self._current_ui = ev.pos()
+        # ① resize 模式：实时更新 ROI 矩形 + 设置对应方向光标
+        if self._resize_edge:
+            self._update_resize_rect(ev.pos())
+            self._video.setCursor(self._get_cursor_for_edge(self._resize_edge))
             self._video.update()
             return True
+        # ② 拖拽模式：钳位到视频显示区域 + 实时更新
+        if self._drawing:
+            l, t, r, b = self._get_video_display_rect()
+            cx = max(l, min(float(ev.pos().x()), r))
+            cy = max(t, min(float(ev.pos().y()), b))
+            self._current_ui = QPoint(round(cx), round(cy))
+            self._video.update()
+            return True
+        # ③ 悬停检测：靠近 ROI 边缘时提示可拖拽
+        if self.roi_rect:
+            edge = self._hit_test_roi_edge(ev.pos())
+            if edge:
+                self._video.setCursor(self._get_cursor_for_edge(edge))
+                return False
+        self._video.setCursor(Qt.CursorShape.ArrowCursor)
         return False
 
+    @staticmethod
+    def _get_cursor_for_edge(edge: str) -> 'Qt.CursorShape':
+        """根据边缘方向返回对应的鼠标指针类型"""
+        mapping = {
+            'l': Qt.CursorShape.SizeHorCursor,
+            'r': Qt.CursorShape.SizeHorCursor,
+            't': Qt.CursorShape.SizeVerCursor,
+            'b': Qt.CursorShape.SizeVerCursor,
+            'tl': Qt.CursorShape.SizeFDiagCursor,
+            'br': Qt.CursorShape.SizeFDiagCursor,
+            'tr': Qt.CursorShape.SizeBDiagCursor,
+            'bl': Qt.CursorShape.SizeBDiagCursor,
+        }
+        return mapping.get(edge, Qt.CursorShape.ArrowCursor)
+
+    def _update_resize_rect(self, ui_pos):
+        """根据鼠标位置和当前调整的边缘，计算新的 ROI 矩形"""
+        if not self._resize_edge or not self._resize_orig_rect:
+            return
+        ox1, oy1, ox2, oy2 = self._resize_orig_rect
+        # 鼠标位置 → 原视频坐标（钳位到视频边界）
+        vx = max(0.0, min((ui_pos.x() - self.off_x) / self.scale, self.orig_w))
+        vy = max(0.0, min((ui_pos.y() - self.off_y) / self.scale, self.orig_h))
+        edge = self._resize_edge
+        if 'l' in edge:
+            ox1 = vx
+        if 'r' in edge:
+            ox2 = vx
+        if 't' in edge:
+            oy1 = vy
+        if 'b' in edge:
+            oy2 = vy
+        n_x1 = min(ox1, ox2)
+        n_y1 = min(oy1, oy2)
+        n_x2 = max(ox1, ox2)
+        n_y2 = max(oy1, oy2)
+        if n_x2 - n_x1 >= 4 and n_y2 - n_y1 >= 4:
+            self.roi_rect = (round(n_x1), round(n_y1), round(n_x2), round(n_y2))
+            self.roi_changed.emit(self.roi_rect)
+        else:
+            self.roi_rect = None
+            self.roi_changed.emit(None)
+
     def _on_release(self, ev):
+        # ① 结束 resize
+        if self._resize_edge and ev.button() == Qt.MouseButton.LeftButton:
+            self._resize_edge = None
+            self._resize_orig_rect = None
+            self._video.update()
+            return True
+        # ② 结束拖拽选区
         if ev.button() == Qt.MouseButton.LeftButton and self._drawing:
             self._drawing = False
-            self._current_ui = ev.pos()
+            # _current_ui 已在 _on_move 中钳位，直接用
             vx1, vy1 = self.ui_to_video(self._start_ui.x(), self._start_ui.y())
             vx2, vy2 = self.ui_to_video(self._current_ui.x(), self._current_ui.y())
             x1 = max(0, min(round(vx1), round(vx2)))
@@ -933,6 +1075,9 @@ class MainVideoWidget(QWidget):
         self._orig_w = 1920
         self._orig_h = 1080
 
+        # ROIOverlay 弱引用（用于读取拖拽状态和选区坐标）
+        self._roi_overlay: Optional['ROIOverlay'] = None
+
         # 背景颜色
         self.setAutoFillBackground(True)
         pal = self.palette()
@@ -948,8 +1093,14 @@ class MainVideoWidget(QWidget):
         self.frame_image = image
         self.repaint()
 
+    def set_roi_overlay(self, overlay: 'ROIOverlay'):
+        """设置 ROIOverlay 引用，用于在绘制时读取选区数据"""
+        self._roi_overlay = overlay
+
     def paintEvent(self, event: QPaintEvent):
         p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
         if self.frame_image and not self.frame_image.isNull():
             img = self.frame_image
             # 等比例缩放
@@ -961,12 +1112,62 @@ class MainVideoWidget(QWidget):
             x = (self.width() - scaled.width()) // 2
             y = (self.height() - scaled.height()) // 2
             p.drawImage(x, y, scaled)
+
+            # ── 绘制 ROI 选区半透明覆盖层 ──
+            self._draw_roi_overlay(p)
         else:
             p.fillRect(self.rect(), QColor(30, 30, 40))
             p.setPen(QColor(120, 120, 140))
             p.setFont(QFont("Microsoft YaHei", 12))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "等待载入视频...")
         p.end()
+
+    def _draw_roi_overlay(self, p: QPainter):
+        """在视频画面上绘制 ROI 选区半透明覆盖层"""
+        overlay = self._roi_overlay
+        if not overlay:
+            return
+
+        # 确保坐标映射最新
+        overlay.update_mapping()
+
+        ux1 = uy1 = ux2 = uy2 = None
+        is_dragging = False
+
+        # ① 优先读取拖拽中的选区（实时跟随鼠标）
+        drag_rect = overlay.get_drag_ui_rect()
+        if drag_rect:
+            ux1, uy1, ux2, uy2 = drag_rect
+            is_dragging = True
+        # ② 否则读取已确定的 ROI（拖拽完成 or SpinBox 编辑）
+        elif overlay.roi_rect:
+            vx1, vy1, vx2, vy2 = overlay.roi_rect
+            ux1, uy1 = overlay.video_to_ui(vx1, vy1)
+            ux2, uy2 = overlay.video_to_ui(vx2, vy2)
+
+        if ux1 is None:
+            return  # 无选区
+
+        # 构建矩形（钳位到控件范围内）
+        rect = QRectF(
+            max(0.0, ux1),
+            max(0.0, uy1),
+            max(4.0, ux2 - ux1),  # 最小宽度 4px
+            max(4.0, uy2 - uy1),  # 最小高度 4px
+        )
+
+        if is_dragging and overlay._drawing:
+            # 新拖拽中：更淡的填充，虚线边框
+            fill = QColor(0, 180, 255, 25)
+            border = QPen(QColor(0, 180, 255, 180), 2, Qt.PenStyle.DashLine)
+        else:
+            # 已确定或 resize 中：半透明填充 + 实线边框
+            fill = QColor(0, 180, 255, 40)
+            border = QPen(QColor(0, 180, 255, 220), 2)
+
+        p.setBrush(QBrush(fill))
+        p.setPen(border)
+        p.drawRect(rect)
 
 
 # ==============================================================================
@@ -1056,12 +1257,19 @@ class ROIPreviewWidget(QWidget):
                 y = (self.height() - scaled.height()) // 2
                 p.drawImage(x, y, scaled)
 
-                # 尺寸标签
-                p.setPen(QColor(200, 200, 200, 200))
+                # 尺寸标签（控件底部偏右，带暗色半透明背景，避免与画面底色混淆）
+                label_text = f"{x2 - x1}×{y2 - y1}"
                 p.setFont(QFont("Consolas", 8))
-                p.drawText(QRect(0, self.height() - 16, self.width(), 14),
-                           Qt.AlignmentFlag.AlignRight,
-                           f"{x2 - x1}×{y2 - y1}  ")
+                fm = p.fontMetrics()
+                lw = fm.horizontalAdvance(label_text) + 10
+                lh = fm.height() + 4
+                lx = self.width() - lw - 4
+                ly = self.height() - lh - 4
+                p.setBrush(QColor(20, 20, 30, 200))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawRoundedRect(lx, ly, lw, lh, 3, 3)
+                p.setPen(QColor(200, 255, 200, 240))
+                p.drawText(lx + 5, ly + 2 + fm.ascent(), label_text)
             else:
                 p.setPen(QColor(130, 130, 150))
                 p.setFont(QFont("Microsoft YaHei", 9))
@@ -1102,7 +1310,11 @@ class VideoPlayerWidget(QWidget):
         self.roi_overlay = ROIOverlay(self.main_video)
         self.roi_overlay.roi_changed.connect(self.roi_changed)
         self.roi_overlay.roi_changed.connect(self._on_roi_for_preview)
+        self.roi_overlay.roi_changed.connect(lambda: self.main_video.update())  # ROI 变化时触发重绘
         self.main_video.installEventFilter(self.roi_overlay)
+
+        # 让 MainVideoWidget 持有 ROIOverlay 引用以读取选区数据
+        self.main_video.set_roi_overlay(self.roi_overlay)
 
         # 注册帧回调（接收 FfmpegPlayer 输出的解码帧）
         self.media_player.add_frame_callback(self._on_frame_changed)
